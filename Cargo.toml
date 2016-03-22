@@ -1,0 +1,7 @@
+[package]
+name = "monkeys"
+version = "0.1.0"
+authors = ["Evgeny Rozaliev <rozaliev@gmail.com>"]
+
+[dependencies]
+context = "*"
