@@ -10,8 +10,8 @@ extern crate context;
 use std::marker::{PhantomData, Reflect};
 use std::fmt::{self, Debug};
 use std::boxed::FnBox;
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, BTreeMap};
 use std::panic::{self, AssertRecoverSafe};
 use std::any::Any;
 use std::collections::VecDeque;
@@ -19,12 +19,16 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use context::{Context, Transfer, ContextFn};
-use context::stack::{ProtectedFixedSizeStack, Stack};
+
+mod stack;
+
+use stack::PooledStack;
 
 
 thread_local!(pub static SCHEDULER: Scheduler = Scheduler::new());
 
-static ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+thread_local!(static ID_COUNTER: Cell<u64> = Cell::new(0));
+
 
 
 #[derive(PartialEq, Eq)]
@@ -35,14 +39,14 @@ enum CoroutineState {
     Ready,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct CoroutineId(usize);
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+struct CoroutineId(u64);
 
 pub struct Scheduler {
     work_queue: RefCell<VecDeque<Box<CoroutineHandle>>>,
-    blocked: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
-    completed: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
-    ready_to_yield: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
+    blocked: RefCell<BTreeMap<CoroutineId, Box<CoroutineHandle>>>,
+    completed: RefCell<BTreeMap<CoroutineId, Box<CoroutineHandle>>>,
+    ready_to_yield: RefCell<BTreeMap<CoroutineId, Box<CoroutineHandle>>>,
 }
 
 struct Handler<Y, R> {
@@ -66,6 +70,7 @@ struct Coroutine<Y, R> {
     transfer: Option<Transfer>,
     state: CoroutineState,
     unwind_ptr: usize,
+    stack: PooledStack
 }
 
 extern "C" fn init_coroutine(mut t: context::Transfer) -> ! {
@@ -85,18 +90,16 @@ extern "C" fn unwind_stack<T: UnwindMove>(t: Transfer) -> Transfer {
     panic::propagate(Box::new(ForceUnwind));
 }
 
+
 pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
     where F: FnOnce(&mut Flow<Y, R>) -> R,
           Y: Reflect + 'static,
           R: Reflect + 'static
 {
-    let stack = ProtectedFixedSizeStack::default();
+    let stack = PooledStack::new();
     let mut transfer = Transfer::new(Context::new(&stack, init_coroutine), 0);
 
     let mut body = Some((box move |mut t: Transfer| {
-        let stack = stack;
-
-
         let mut unwind_flow_storage = None;
 
         let mut flow = Flow {
@@ -107,6 +110,7 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
                 transfer: Some(t),
                 state: CoroutineState::Ready,
                 unwind_ptr: to_mut_ptr(&mut unwind_flow_storage),
+                stack: stack,
             }),
         };
 
@@ -181,8 +185,6 @@ trait CoroutineHandle {
 
     fn co_id(&self) -> CoroutineId;
 
-    fn take_inner(&mut self) -> Box<Any>;
-
     fn inner_mut(&mut self) -> &mut Any;
 
     fn kill(&mut self);
@@ -190,6 +192,7 @@ trait CoroutineHandle {
 }
 
 impl<Y: Reflect + 'static, R: Reflect + 'static> CoroutineHandle for Handler<Y, R> {
+
     fn state(&self) -> &CoroutineState {
         self.flow.as_ref().unwrap().state()
     }
@@ -208,6 +211,7 @@ impl<Y: Reflect + 'static, R: Reflect + 'static> CoroutineHandle for Handler<Y, 
         self.flow = Some(flow);
     }
 
+    #[inline]
     fn co_id(&self) -> CoroutineId {
         self.flow.as_ref().unwrap().coroutine_id()
     }
@@ -220,9 +224,6 @@ impl<Y: Reflect + 'static, R: Reflect + 'static> CoroutineHandle for Handler<Y, 
         CoroutineState::ReadyToYield == *self.flow.as_ref().unwrap().state()
     }
 
-    fn take_inner(&mut self) -> Box<Any> {
-        box self.flow.take().unwrap()
-    }
 
     fn inner_mut(&mut self) -> &mut Any {
         self.flow.as_mut().unwrap()
@@ -239,9 +240,9 @@ impl Scheduler {
     fn new() -> Scheduler {
         Scheduler {
             work_queue: RefCell::new(VecDeque::new()),
-            blocked: RefCell::new(HashMap::new()),
-            completed: RefCell::new(HashMap::new()),
-            ready_to_yield: RefCell::new(HashMap::new()),
+            blocked: RefCell::new(BTreeMap::new()),
+            completed: RefCell::new(BTreeMap::new()),
+            ready_to_yield: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -349,7 +350,11 @@ impl Scheduler {
 
 impl CoroutineId {
     fn new() -> CoroutineId {
-        CoroutineId(ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+        ID_COUNTER.with(|c| {
+            let id = c.get();
+            c.set(id + 1);
+            CoroutineId(id)
+        })
     }
 }
 
@@ -370,12 +375,13 @@ impl<Y, R> Flow<Y, R> {
             sc.completed.borrow_mut().remove(&stream.co_id).unwrap()
         });
 
-        let mut inner = handler.take_inner();
+        let mut inner = handler.inner_mut();
         let f: &mut Flow<(), A> = inner.downcast_mut().unwrap();
         f.result_mut().take().unwrap()
 
     }
 
+    #[inline(always)]
     fn resume(&mut self) {
         let mut t = self.transfer_mut().take().unwrap();
         let co = self.coroutine.take().unwrap();
@@ -408,26 +414,32 @@ impl<Y, R> Flow<Y, R> {
         self.coroutine = s.coroutine.take();
     }
 
+    #[inline(always)]
     fn result_mut(&mut self) -> &mut Option<R> {
         &mut self.coroutine.as_mut().unwrap().result_val
     }
 
+    #[inline(always)]
     fn yield_mut(&mut self) -> &mut Option<Y> {
         &mut self.coroutine.as_mut().unwrap().yield_val
     }
 
+    #[inline(always)]
     fn state_mut(&mut self) -> &mut CoroutineState {
         &mut self.coroutine.as_mut().unwrap().state
     }
 
+    #[inline(always)]
     fn state(&self) -> &CoroutineState {
         &self.coroutine.as_ref().unwrap().state
     }
 
+    #[inline(always)]
     fn transfer_mut(&mut self) -> &mut Option<Transfer> {
         &mut self.coroutine.as_mut().unwrap().transfer
     }
 
+    #[inline(always)]
     fn coroutine_id(&self) -> CoroutineId {
         self.coroutine.as_ref().unwrap().coroutine_id
     }
@@ -473,7 +485,7 @@ impl<R: Reflect + 'static> Stream<(), R> {
             sc.completed.borrow_mut().remove(&self.co_id).unwrap()
         });
 
-        let mut inner = handler.take_inner();
+        let mut inner = handler.inner_mut();
         let f: &mut Flow<(), R> = inner.downcast_mut().unwrap();
         f.result_mut().take().unwrap()
     }
