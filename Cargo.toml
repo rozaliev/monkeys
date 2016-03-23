@@ -1,7 +1,10 @@
 [package]
 name = "monkeys"
+description = "Coroutines with async/await/yield"
 version = "0.1.0"
 authors = ["Evgeny Rozaliev <rozaliev@gmail.com>"]
+repository = "https://github.com/rozaliev/monkeys"
+license = "MIT"
 
 [dependencies]
 context = "*"
