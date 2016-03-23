@@ -642,22 +642,29 @@ mod tests {
         })
     }
 
-    // FIXME: should we even do this? mb bg async tasks should stay there
     #[test]
-    fn bg_async_dropped() {
+    fn get_inside_async() {
+        let r = async(|flow| async(|flow| 0).get()).get();
 
-        {
-            async(|_| {
-                // FIXME: type interference && check get inside async
-                async::<_, (), ()>(|_| loop {});
-            })
-                .get();
-        }
-
-        SCHEDULER.with(|sc| {
-            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
-            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
-            assert_eq!(sc.completed.borrow_mut().len(), 0);
-        })
+        assert_eq!(r, 0);
     }
+
+    // FIXME: should we even do this? mb bg async tasks should stay there
+    // #[test]
+    // fn bg_async_dropped() {
+    //
+    //     {
+    //         async(|_| {
+    //             // FIXME: type interference && check get inside async
+    //             async::<_, (), ()>(|_| loop {});
+    //         })
+    //             .get();
+    //     }
+    //
+    //     SCHEDULER.with(|sc| {
+    //         assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+    //         assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+    //         assert_eq!(sc.completed.borrow_mut().len(), 0);
+    //     })
+    // }
 }
