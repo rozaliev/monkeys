@@ -7,4 +7,4 @@ repository = "https://github.com/rozaliev/monkeys"
 license = "MIT"
 
 [dependencies]
-context = "*"
+context = "1.0"
