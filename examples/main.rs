@@ -4,6 +4,9 @@ use monkeys::async;
 
 fn main() {
     loop {
-        async(|_| 3).get();
+        async(|f| {
+            f.await(async(|_| 3));
+        })
+            .get();
     }
 }

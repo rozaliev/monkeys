@@ -19,6 +19,16 @@ fn bench_simple(b: &mut Bencher) {
 
 
 #[bench]
+fn bench_simple_await(b: &mut Bencher) {
+    b.iter(|| {
+        async(|f| {
+            f.await(async(|_| 3));
+        })
+            .get();
+    })
+}
+
+#[bench]
 fn bench_simple_ref(b: &mut Bencher) {
     let f = || 3;
 
