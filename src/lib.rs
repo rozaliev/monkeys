@@ -422,7 +422,7 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn simple() {
+    fn simple_async() {
         let res = async(|_| 3).get();
 
         assert_eq!(res, 3);
@@ -459,6 +459,42 @@ mod tests {
         }
 
         assert_eq!(None, stream.next());
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
+
+    }
+
+    #[test]
+    fn yield_it_in_async() {
+        let r = async(|_| {
+                    let mut stream = async(|flow| {
+                        let stream2 = async(|flow| {
+                            for i in 0..5 {
+                                flow.yield_it(i)
+                            }
+                        });
+
+                        for v in stream2 {
+                            flow.yield_it(v)
+                        }
+                    });
+
+                    for i in 0..5 {
+                        assert_eq!(Some(i), stream.next());
+                    }
+
+                    assert_eq!(None, stream.next());
+                    333
+                })
+                    .get();
+
+
+
+        assert_eq!(r, 333);
 
         SCHEDULER.with(|sc| {
             assert_eq!(sc.work_queue.borrow_mut().len(), 0);
