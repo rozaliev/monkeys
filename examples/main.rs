@@ -11,11 +11,11 @@ fn main() {
     });
 
     for i in 0..5 {
-        let val = stream.next();
-        println!("got: {:?}", val);
-        assert_eq!(Some(i), val);
+        let v = stream.next();
+        println!("v: {:?}", v);
+        assert_eq!(Some(i), v);
     }
 
-    assert_eq!(stream.next(), None);
+    assert_eq!(None, stream.next());
 
 }

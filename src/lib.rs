@@ -21,8 +21,7 @@ use context::{Context, Transfer, ContextFn};
 use context::stack::{ProtectedFixedSizeStack, Stack};
 
 
-thread_local!(static SCHEDULER: Scheduler = Scheduler::new());
-thread_local!(static NEW_CORS: RefCell<VecDeque<Box<CoroutineHandle>>> = RefCell::new(VecDeque::new()));
+thread_local!(pub static SCHEDULER: Scheduler = Scheduler::new());
 
 static ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -38,8 +37,9 @@ enum CoroutineState {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct CoroutineId(usize);
 
-struct Scheduler {
-    coroutines: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
+pub struct Scheduler {
+    work_queue: RefCell<VecDeque<Box<CoroutineHandle>>>,
+    blocked: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
     completed: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
     ready_to_yield: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
 }
@@ -52,6 +52,7 @@ pub struct Flow<Y, R> {
     coroutine: Option<Coroutine<Y, R>>,
 }
 
+// FIXME: add drop to remove from sched and dealloc coroutine
 pub struct Stream<Y, R> {
     is_done: bool,
     result_co_id: CoroutineId,
@@ -126,9 +127,8 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
         types: PhantomData,
     };
 
-    NEW_CORS.with(|list| {
-        list.borrow_mut().push_back(box Handler { flow: Some(flow) });
-    });
+
+    SCHEDULER.with(|sc| sc.add_co(box Handler { flow: Some(flow) }));
 
     stream
 }
@@ -199,103 +199,72 @@ impl<Y: Reflect + 'static, R: Reflect + 'static> CoroutineHandle for Handler<Y, 
 impl Scheduler {
     fn new() -> Scheduler {
         Scheduler {
-            coroutines: RefCell::new(HashMap::new()),
+            work_queue: RefCell::new(VecDeque::new()),
+            blocked: RefCell::new(HashMap::new()),
             completed: RefCell::new(HashMap::new()),
             ready_to_yield: RefCell::new(HashMap::new()),
         }
     }
 
-    fn schedule_till_complete(&self, co_id: CoroutineId) {
-        loop {
-            let mut complete = None;
-
-            'inner: loop {
-                self.pullin_new_cors();
-                for (id, co) in &mut *self.coroutines.borrow_mut() {
-                    match *co.state() {
-                        CoroutineState::Ready => {}
-
-                        CoroutineState::BlockedOnCo(co_id) => {
-                            if !self.completed.borrow().contains_key(&co_id) {
-                                continue;
-                            }
-                            *co.state_mut() = CoroutineState::Ready;
-                        }
-
-                        _ => continue,
-                    }
-
-                    co.run();
-
-                    if co.is_complete() {
-                        complete = Some(*id);
-                        break 'inner;
-                    }
-                }
-            }
-
-            let id = complete.unwrap();
-            let h = self.coroutines.borrow_mut().remove(&id).unwrap();
-            self.completed.borrow_mut().insert(id, h);
-
-            if id == co_id {
-                return;
-            }
-
-        }
-    }
-
-    fn schedule_till_can_yield(&self, co_id: CoroutineId) {
-        if let Some(co) = self.ready_to_yield.borrow_mut().remove(&co_id) {
-            self.coroutines.borrow_mut().insert(co_id, co);
+    fn schedule_till(&self, wait_id: CoroutineId) {
+        if let Some(co) = self.ready_to_yield.borrow_mut().remove(&wait_id) {
+            self.work_queue.borrow_mut().push_back(co);
         }
 
 
         loop {
-            let mut can_yield = None;
 
-            'inner: loop {
-                self.pullin_new_cors();
-                for (id, co) in &mut *self.coroutines.borrow_mut() {
-                    match *co.state() {
-                        CoroutineState::Ready => {}
-                        CoroutineState::ReadyToYield => {}
+            // self.resolve_external_compliter(); // for network
+            // self.resolve_timers();
+            let co_opt = self.work_queue.borrow_mut().pop_front();
+            if let Some(mut co) = co_opt {
+                co.run();
 
-                        CoroutineState::BlockedOnCo(co_id) => {
-                            if !self.completed.borrow().contains_key(&co_id) {
-                                continue;
-                            }
-                            *co.state_mut() = CoroutineState::Ready;
-                        }
-
-                        _ => continue,
+                match *co.state() {
+                    CoroutineState::BlockedOnCo(block_id) => {
+                        self.blocked.borrow_mut().insert(block_id, co);
                     }
 
-                    co.run();
+                    CoroutineState::Complete => {
+                        let id = co.co_id();
+                        self.completed.borrow_mut().insert(id, co);
 
-                    if co.is_ready_to_yield() || co.is_complete() {
-                        can_yield = Some(*id);
-                        break 'inner;
+                        if let Some(blocked) = self.blocked.borrow_mut().remove(&id) {
+                            self.work_queue.borrow_mut().push_back(blocked);
+                        }
+
+                        if id == wait_id {
+                            return;
+                        }
+                    }
+
+                    CoroutineState::ReadyToYield => {
+                        let id = co.co_id();
+                        self.ready_to_yield.borrow_mut().insert(id, co);
+
+                        if let Some(blocked) = self.blocked.borrow_mut().remove(&id) {
+                            self.work_queue.borrow_mut().push_back(blocked);
+                        }
+
+                        if id == wait_id {
+                            return;
+                        }
+                    }
+
+                    CoroutineState::Ready => {
+                        panic!("coroutine {:?} is ready after run ", co.co_id())
                     }
                 }
             }
 
-            let id = can_yield.unwrap();
-            let h = self.coroutines.borrow_mut().remove(&id).unwrap();
-            self.ready_to_yield.borrow_mut().insert(id, h);
-
-            if id == co_id {
-                return;
-            }
 
         }
     }
+
 
 
     fn get_yield_for<Y: Reflect + 'static>(&self, co_id: CoroutineId) -> Option<Y> {
-
-        if self.ready_to_yield.borrow().get(&co_id).unwrap().is_complete() {
-            let _ = self.ready_to_yield.borrow_mut().remove(&co_id);
+        if let Some(_) = self.completed.borrow_mut().remove(&co_id) {
             return None;
         }
 
@@ -321,13 +290,8 @@ impl Scheduler {
         opt
     }
 
-    fn pullin_new_cors(&self) {
-        NEW_CORS.with(|l| {
-            let mut list = l.borrow_mut();
-            while let Some(h) = list.pop_front() {
-                self.coroutines.borrow_mut().insert(h.co_id(), h);
-            }
-        })
+    fn add_co(&self, handle: Box<CoroutineHandle>) {
+        self.work_queue.borrow_mut().push_back(handle);
     }
 }
 
@@ -414,10 +378,12 @@ fn to_mut_ptr<T>(data: &mut Option<T>) -> usize {
     data as *mut _ as usize
 }
 
+
+
 impl<R: Reflect + 'static> Stream<(), R> {
     pub fn get(self) -> R {
         let mut handler = SCHEDULER.with(|sc| {
-            sc.schedule_till_complete(self.result_co_id);
+            sc.schedule_till(self.result_co_id);
             sc.completed.borrow_mut().remove(&self.result_co_id).unwrap()
         });
 
@@ -436,10 +402,16 @@ impl<Y: Reflect + 'static> Iterator for Stream<Y, ()> {
             return None;
         }
 
-        SCHEDULER.with(|sc| {
-            sc.schedule_till_can_yield(self.result_co_id);
+        let opt = SCHEDULER.with(|sc| {
+            sc.schedule_till(self.result_co_id);
             sc.get_yield_for(self.result_co_id)
-        })
+        });
+
+        if opt.is_none() {
+            self.is_done = true;
+        }
+
+        opt
     }
 }
 
@@ -454,12 +426,24 @@ mod tests {
         let res = async(|_| 3).get();
 
         assert_eq!(res, 3);
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
     }
 
     #[test]
     fn await() {
         let res = async(|flow| flow.await(async(|_| 3))).get();
         assert_eq!(res, 3);
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
     }
 
     #[test]
@@ -475,6 +459,12 @@ mod tests {
         }
 
         assert_eq!(None, stream.next());
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
 
     }
 }
