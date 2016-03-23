@@ -472,6 +472,7 @@ fn from_mut_ptr<T>(ptr: usize) -> T {
     }
 }
 
+#[inline(always)]
 fn to_mut_ptr<T>(data: &mut Option<T>) -> usize {
     data as *mut _ as usize
 }
@@ -666,7 +667,7 @@ mod tests {
     //
     //     {
     //         async(|_| {
-    //             // FIXME: type interference && check get inside async
+    //             // FIXME: type inference 
     //             async::<_, (), ()>(|_| loop {});
     //         })
     //             .get();
