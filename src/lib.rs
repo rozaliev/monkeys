@@ -30,6 +30,7 @@ static ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 #[derive(PartialEq, Eq)]
 enum CoroutineState {
     BlockedOnCo(CoroutineId),
+    ReadyToYield,
     Complete,
     Ready,
 }
@@ -40,6 +41,7 @@ struct CoroutineId(usize);
 struct Scheduler {
     coroutines: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
     completed: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
+    ready_to_yield: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
 }
 
 struct Handler<Y, R> {
@@ -51,13 +53,14 @@ pub struct Flow<Y, R> {
 }
 
 pub struct Stream<Y, R> {
+    is_done: bool,
     result_co_id: CoroutineId,
     types: PhantomData<(Y, R)>,
 }
 
 struct Coroutine<Y, R> {
     coroutine_id: CoroutineId,
-    yield_type: PhantomData<Y>,
+    yield_val: Option<Y>,
     result_val: Option<R>,
     transfer: Option<Transfer>,
     state: CoroutineState,
@@ -85,7 +88,7 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
         let mut flow = Flow {
             coroutine: Some(Coroutine {
                 coroutine_id: CoroutineId::new(),
-                yield_type: PhantomData,
+                yield_val: None,
                 result_val: None,
                 transfer: Some(t),
                 state: CoroutineState::Ready,
@@ -118,6 +121,7 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
     debug_assert!(body.is_none());
 
     let stream = Stream {
+        is_done: false,
         result_co_id: flow.coroutine_id(),
         types: PhantomData,
     };
@@ -139,11 +143,15 @@ trait CoroutineHandle {
 
     fn is_complete(&self) -> bool;
 
+    fn is_ready_to_yield(&self) -> bool;
+
     fn run(&mut self);
 
     fn co_id(&self) -> CoroutineId;
 
     fn take_inner(&mut self) -> Box<Any>;
+
+    fn inner_mut(&mut self) -> &mut Any;
 
 }
 
@@ -174,8 +182,16 @@ impl<Y: Reflect + 'static, R: Reflect + 'static> CoroutineHandle for Handler<Y, 
         CoroutineState::Complete == *self.flow.as_ref().unwrap().state()
     }
 
+    fn is_ready_to_yield(&self) -> bool {
+        CoroutineState::ReadyToYield == *self.flow.as_ref().unwrap().state()
+    }
+
     fn take_inner(&mut self) -> Box<Any> {
         box self.flow.take().unwrap()
+    }
+
+    fn inner_mut(&mut self) -> &mut Any {
+        self.flow.as_mut().unwrap()
     }
 }
 
@@ -185,6 +201,7 @@ impl Scheduler {
         Scheduler {
             coroutines: RefCell::new(HashMap::new()),
             completed: RefCell::new(HashMap::new()),
+            ready_to_yield: RefCell::new(HashMap::new()),
         }
     }
 
@@ -226,7 +243,82 @@ impl Scheduler {
             }
 
         }
+    }
 
+    fn schedule_till_can_yield(&self, co_id: CoroutineId) {
+        if let Some(co) = self.ready_to_yield.borrow_mut().remove(&co_id) {
+            self.coroutines.borrow_mut().insert(co_id, co);
+        }
+
+
+        loop {
+            let mut can_yield = None;
+
+            'inner: loop {
+                self.pullin_new_cors();
+                for (id, co) in &mut *self.coroutines.borrow_mut() {
+                    match *co.state() {
+                        CoroutineState::Ready => {}
+                        CoroutineState::ReadyToYield => {}
+
+                        CoroutineState::BlockedOnCo(co_id) => {
+                            if !self.completed.borrow().contains_key(&co_id) {
+                                continue;
+                            }
+                            *co.state_mut() = CoroutineState::Ready;
+                        }
+
+                        _ => continue,
+                    }
+
+                    co.run();
+
+                    if co.is_ready_to_yield() || co.is_complete() {
+                        can_yield = Some(*id);
+                        break 'inner;
+                    }
+                }
+            }
+
+            let id = can_yield.unwrap();
+            let h = self.coroutines.borrow_mut().remove(&id).unwrap();
+            self.ready_to_yield.borrow_mut().insert(id, h);
+
+            if id == co_id {
+                return;
+            }
+
+        }
+    }
+
+
+    fn get_yield_for<Y: Reflect + 'static>(&self, co_id: CoroutineId) -> Option<Y> {
+
+        if self.ready_to_yield.borrow().get(&co_id).unwrap().is_complete() {
+            let _ = self.ready_to_yield.borrow_mut().remove(&co_id);
+            return None;
+        }
+
+        let mut handle_ref = self.ready_to_yield.borrow_mut();
+        let handle = handle_ref.get_mut(&co_id).unwrap();
+
+        let flow: &mut Flow<Y, ()> = handle.inner_mut()
+                                           .downcast_mut()
+                                           .unwrap();
+
+        let opt = flow.coroutine
+                      .as_mut()
+                      .unwrap()
+                      .yield_val
+                      .take();
+
+
+
+
+
+
+
+        opt
     }
 
     fn pullin_new_cors(&self) {
@@ -247,7 +339,11 @@ impl CoroutineId {
 }
 
 impl<Y> Flow<Y, ()> {
-    fn yield_it(&mut self, stream_val: Y) {}
+    pub fn yield_it(&mut self, stream_val: Y) {
+        *self.state_mut() = CoroutineState::ReadyToYield;
+        *self.yield_mut() = Some(stream_val);
+        self.resume();
+    }
 }
 
 impl<Y, R> Flow<Y, R> {
@@ -280,6 +376,10 @@ impl<Y, R> Flow<Y, R> {
 
     fn result_mut(&mut self) -> &mut Option<R> {
         &mut self.coroutine.as_mut().unwrap().result_val
+    }
+
+    fn yield_mut(&mut self) -> &mut Option<Y> {
+        &mut self.coroutine.as_mut().unwrap().yield_val
     }
 
     fn state_mut(&mut self) -> &mut CoroutineState {
@@ -328,12 +428,18 @@ impl<R: Reflect + 'static> Stream<(), R> {
 }
 
 
-impl<Y> Iterator for Stream<Y, ()> {
+impl<Y: Reflect + 'static> Iterator for Stream<Y, ()> {
     type Item = Y;
 
     fn next(&mut self) -> Option<Y> {
-        // self.stream_val.take()
-        unimplemented!()
+        if self.is_done {
+            return None;
+        }
+
+        SCHEDULER.with(|sc| {
+            sc.schedule_till_can_yield(self.result_co_id);
+            sc.get_yield_for(self.result_co_id)
+        })
     }
 }
 
@@ -345,7 +451,7 @@ mod tests {
 
     #[test]
     fn simple() {
-        let res = async(|flow| 3).get();
+        let res = async(|_| 3).get();
 
         assert_eq!(res, 3);
     }
@@ -355,19 +461,20 @@ mod tests {
         let res = async(|flow| flow.await(async(|_| 3))).get();
         assert_eq!(res, 3);
     }
-    // #[test]
-    // fn yield_it() {
-    //     let mut stream = async(|flow| {
-    //         for i in 0..5 {
-    //             flow.yield_it(i)
-    //         }
-    //     });
-    //
-    //     for i in 0..5 {
-    //         assert_eq!(Some(i), stream.next());
-    //     }
-    //
-    //     assert_eq!(None, stream.next());
-    //
-    // }
+
+    #[test]
+    fn yield_it() {
+        let mut stream = async(|flow| {
+            for i in 0..5 {
+                flow.yield_it(i)
+            }
+        });
+
+        for i in 0..5 {
+            assert_eq!(Some(i), stream.next());
+        }
+
+        assert_eq!(None, stream.next());
+
+    }
 }
