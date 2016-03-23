@@ -51,6 +51,8 @@ prints
 
 There won't be network stack itself. Monkeys are building blocks for higher level libraries.
 
+No M:N scheduling, single thread only.
+
 
 ## Plan
 
