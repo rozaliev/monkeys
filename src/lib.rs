@@ -53,7 +53,6 @@ pub struct Flow<Y, R> {
     coroutine: Option<Coroutine<Y, R>>,
 }
 
-// FIXME: add drop to remove from sched and dealloc coroutine
 pub struct Stream<Y, R> {
     is_done: bool,
     co_id: CoroutineId,
