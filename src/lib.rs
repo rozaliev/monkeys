@@ -3,6 +3,7 @@
 #![feature(recover, std_panic)]
 #![feature(reflect_marker)]
 #![feature(const_fn)]
+#![feature(panic_propagate)]
 
 extern crate context;
 
@@ -55,7 +56,7 @@ pub struct Flow<Y, R> {
 // FIXME: add drop to remove from sched and dealloc coroutine
 pub struct Stream<Y, R> {
     is_done: bool,
-    result_co_id: CoroutineId,
+    co_id: CoroutineId,
     types: PhantomData<(Y, R)>,
 }
 
@@ -65,6 +66,7 @@ struct Coroutine<Y, R> {
     result_val: Option<R>,
     transfer: Option<Transfer>,
     state: CoroutineState,
+    unwind_ptr: usize,
 }
 
 extern "C" fn init_coroutine(mut t: context::Transfer) -> ! {
@@ -73,6 +75,15 @@ extern "C" fn init_coroutine(mut t: context::Transfer) -> ! {
     body(t);
 
     unimplemented!()
+}
+
+
+extern "C" fn unwind_stack<T: UnwindMove>(t: Transfer) -> Transfer {
+    let flow: T = from_mut_ptr(t.data);
+    flow.move_into_unwind(t);
+
+    struct ForceUnwind;
+    panic::propagate(Box::new(ForceUnwind));
 }
 
 pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
@@ -84,7 +95,10 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
     let mut transfer = Transfer::new(Context::new(&stack, init_coroutine), 0);
 
     let mut body = Some((box move |mut t: Transfer| {
-        let _ = stack;
+        let stack = stack;
+
+
+        let mut unwind_flow_storage = None;
 
         let mut flow = Flow {
             coroutine: Some(Coroutine {
@@ -93,15 +107,34 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
                 result_val: None,
                 transfer: Some(t),
                 state: CoroutineState::Ready,
+                unwind_ptr: to_mut_ptr(&mut unwind_flow_storage),
             }),
         };
 
 
 
-        flow.resume();
 
-        *flow.result_mut() = Some(f(&mut flow));
-        *flow.state_mut() = CoroutineState::Complete;
+
+        let mut f_wrapper = AssertRecoverSafe::new(Some(f));
+        let mut flow_wrapper = AssertRecoverSafe::new(Some(flow));
+
+        let result = panic::recover(move || {
+            let mut flow = flow_wrapper.take().unwrap();
+
+            flow.resume();
+
+            let mut f = f_wrapper.take().unwrap();
+
+            *flow.result_mut() = Some(f(&mut flow));
+            *flow.state_mut() = CoroutineState::Complete;
+
+            flow
+        });
+
+        let mut flow = match result {
+            Ok(flow) => flow,
+            Err(err) => unwind_flow_storage.unwrap(),
+        };
 
 
         flow.resume();
@@ -123,7 +156,7 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
 
     let stream = Stream {
         is_done: false,
-        result_co_id: flow.coroutine_id(),
+        co_id: flow.coroutine_id(),
         types: PhantomData,
     };
 
@@ -152,6 +185,8 @@ trait CoroutineHandle {
     fn take_inner(&mut self) -> Box<Any>;
 
     fn inner_mut(&mut self) -> &mut Any;
+
+    fn kill(&mut self);
 
 }
 
@@ -192,6 +227,11 @@ impl<Y: Reflect + 'static, R: Reflect + 'static> CoroutineHandle for Handler<Y, 
 
     fn inner_mut(&mut self) -> &mut Any {
         self.flow.as_mut().unwrap()
+    }
+
+    fn kill(&mut self) {
+        let mut flow = self.flow.take().unwrap();
+        flow.kill();
     }
 }
 
@@ -290,6 +330,18 @@ impl Scheduler {
         opt
     }
 
+    fn drop_co(&self, co: CoroutineId) {
+        let h_opt = self.completed.borrow_mut().remove(&co);
+        if let Some(mut h) = h_opt {
+            h.kill();
+        }
+
+        let h_opt = self.ready_to_yield.borrow_mut().remove(&co);
+        if let Some(mut h) = h_opt {
+            h.kill();
+        }
+    }
+
     fn add_co(&self, handle: Box<CoroutineHandle>) {
         self.work_queue.borrow_mut().push_back(handle);
     }
@@ -312,11 +364,11 @@ impl<Y> Flow<Y, ()> {
 
 impl<Y, R> Flow<Y, R> {
     pub fn await<A: Reflect + 'static>(&mut self, stream: Stream<(), A>) -> A {
-        *self.state_mut() = CoroutineState::BlockedOnCo(stream.result_co_id);
+        *self.state_mut() = CoroutineState::BlockedOnCo(stream.co_id);
         self.resume();
 
         let mut handler = SCHEDULER.with(|sc| {
-            sc.completed.borrow_mut().remove(&stream.result_co_id).unwrap()
+            sc.completed.borrow_mut().remove(&stream.co_id).unwrap()
         });
 
         let mut inner = handler.take_inner();
@@ -332,6 +384,25 @@ impl<Y, R> Flow<Y, R> {
         let mut some_self = Some(Flow { coroutine: Some(co) });
         let self_ptr = to_mut_ptr(&mut some_self);
         t = t.context.resume(self_ptr);
+        let mut s: Self = from_mut_ptr(t.data);
+        *s.transfer_mut() = Some(t);
+
+        self.coroutine = s.coroutine.take();
+    }
+
+    fn kill(&mut self) {
+        if CoroutineState::Complete == *self.state() {
+            return;
+        }
+
+        let mut t = self.transfer_mut().take().unwrap();
+        let co = self.coroutine.take().unwrap();
+
+        let mut some_self = Some(Flow { coroutine: Some(co) });
+        let self_ptr = to_mut_ptr(&mut some_self);
+
+        t = t.context.resume_ontop(self_ptr, unwind_stack::<Self>);
+
         let mut s: Self = from_mut_ptr(t.data);
         *s.transfer_mut() = Some(t);
 
@@ -363,6 +434,22 @@ impl<Y, R> Flow<Y, R> {
     }
 }
 
+trait UnwindMove {
+    fn move_into_unwind(self, t: Transfer);
+}
+
+impl<Y, R> UnwindMove for Flow<Y, R> {
+    fn move_into_unwind(mut self, t: Transfer) {
+        *self.transfer_mut() = Some(t);
+
+        let o = unsafe {
+            let ptr = self.coroutine.as_ref().unwrap().unwind_ptr;
+            &mut *(ptr as *mut Option<Self>)
+        };
+        *o = Some(Flow { coroutine: self.coroutine.take() });
+    }
+}
+
 
 
 
@@ -383,8 +470,8 @@ fn to_mut_ptr<T>(data: &mut Option<T>) -> usize {
 impl<R: Reflect + 'static> Stream<(), R> {
     pub fn get(self) -> R {
         let mut handler = SCHEDULER.with(|sc| {
-            sc.schedule_till(self.result_co_id);
-            sc.completed.borrow_mut().remove(&self.result_co_id).unwrap()
+            sc.schedule_till(self.co_id);
+            sc.completed.borrow_mut().remove(&self.co_id).unwrap()
         });
 
         let mut inner = handler.take_inner();
@@ -403,8 +490,8 @@ impl<Y: Reflect + 'static> Iterator for Stream<Y, ()> {
         }
 
         let opt = SCHEDULER.with(|sc| {
-            sc.schedule_till(self.result_co_id);
-            sc.get_yield_for(self.result_co_id)
+            sc.schedule_till(self.co_id);
+            sc.get_yield_for(self.co_id)
         });
 
         if opt.is_none() {
@@ -412,6 +499,14 @@ impl<Y: Reflect + 'static> Iterator for Stream<Y, ()> {
         }
 
         opt
+    }
+}
+
+impl<Y, R> Drop for Stream<Y, R> {
+    fn drop(&mut self) {
+        SCHEDULER.with(|sc| {
+            sc.drop_co(self.co_id);
+        });
     }
 }
 
@@ -501,6 +596,68 @@ mod tests {
             assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
             assert_eq!(sc.completed.borrow_mut().len(), 0);
         })
+    }
 
+    #[test]
+    fn yield_cleared_on_drop() {
+
+        {
+            let stream = async(|flow| {
+                for i in 0..5 {
+                    flow.yield_it(i)
+                }
+            });
+
+            stream.take(5).collect::<Vec<_>>();
+        }
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
+    }
+
+    #[test]
+    fn yield_cleared_on_drop_with_blocked() {
+
+        {
+            let mut stream = async(|flow| {
+                for i in 0..5 {
+                    let mut s = async(|flow| flow.yield_it(0));
+                    let mut s2 = async(|flow| flow.yield_it(1));
+                    s2.next();
+
+                    flow.yield_it(i);
+                }
+            });
+
+            let _ = stream.next();
+        }
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
+    }
+
+    // FIXME: should we even do this? mb bg async tasks should stay there
+    #[test]
+    fn bg_async_dropped() {
+
+        {
+            async(|_| {
+                // FIXME: type interference && check get inside async
+                async::<_, (), ()>(|_| loop {});
+            })
+                .get();
+        }
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
     }
 }
