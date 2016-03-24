@@ -92,7 +92,7 @@ extern "C" fn unwind_stack<T: UnwindMove>(t: Transfer) -> Transfer {
 
 
 pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
-    where F: FnOnce(&mut Flow<Y, R>) -> R,
+    where F: FnOnce(&mut Flow<Y, R>) -> R + 'static,
           Y: Reflect + 'static,
           R: Reflect + 'static
 {
@@ -661,22 +661,23 @@ mod tests {
         assert_eq!(r, 0);
     }
 
-    // FIXME: should we even do this? mb bg async tasks should stay there
+    // FIXME: type inference for
+    // async::<_, (), ()>(|_| loop {});
+
+
+    // FIXME: compile test, should not compile
     // #[test]
-    // fn bg_async_dropped() {
+    // fn no_ref_from_stack() {
+    //     struct TestMe(usize);
     //
-    //     {
-    //         async(|_| {
-    //             // FIXME: type inference 
-    //             async::<_, (), ()>(|_| loop {});
-    //         })
-    //             .get();
+    //     fn f1(a: &TestMe) -> Stream<(),usize> {
+    //         async(|_| a.0)
     //     }
     //
-    //     SCHEDULER.with(|sc| {
-    //         assert_eq!(sc.work_queue.borrow_mut().len(), 0);
-    //         assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
-    //         assert_eq!(sc.completed.borrow_mut().len(), 0);
-    //     })
+    //     fn f2() -> Stream<(),usize>{
+    //         let tm = TestMe(333);
+    //         f1(&tm)
+    //     }
+    //
+    //     f2().get();
     // }
-}
