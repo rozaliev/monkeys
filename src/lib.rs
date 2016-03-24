@@ -15,6 +15,7 @@ use std::collections::{HashMap, BTreeMap};
 use std::panic::{self, AssertRecoverSafe};
 use std::any::Any;
 use std::collections::VecDeque;
+use std::mem;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -27,7 +28,7 @@ use stack::PooledStack;
 
 thread_local!(pub static SCHEDULER: Scheduler = Scheduler::new());
 
-thread_local!(static ID_COUNTER: Cell<u64> = Cell::new(0));
+thread_local!(static ID_COUNTER: Cell<usize> = Cell::new(0));
 
 
 
@@ -40,13 +41,15 @@ enum CoroutineState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-struct CoroutineId(u64);
+pub struct CoroutineId(usize);
 
 pub struct Scheduler {
     work_queue: RefCell<VecDeque<Box<CoroutineHandle>>>,
-    blocked: RefCell<BTreeMap<CoroutineId, Box<CoroutineHandle>>>,
-    completed: RefCell<BTreeMap<CoroutineId, Box<CoroutineHandle>>>,
-    ready_to_yield: RefCell<BTreeMap<CoroutineId, Box<CoroutineHandle>>>,
+    blocked: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
+    completed: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
+    ready_to_yield: RefCell<HashMap<CoroutineId, Box<CoroutineHandle>>>,
+
+    external_notifier: RefCell<Box<ExternalNotifier>>
 }
 
 struct Handler<Y, R> {
@@ -59,6 +62,7 @@ pub struct Flow<Y, R> {
 
 pub struct Stream<Y, R> {
     is_done: bool,
+    is_external: bool,
     co_id: CoroutineId,
     types: PhantomData<(Y, R)>,
 }
@@ -71,6 +75,36 @@ struct Coroutine<Y, R> {
     state: CoroutineState,
     unwind_ptr: usize,
     stack: PooledStack
+}
+
+pub struct ExternalBlocker<'a> {
+    sc: &'a Scheduler
+}
+
+trait CoroutineHandle {
+
+    fn state(&self) -> &CoroutineState;
+
+    fn state_mut(&mut self) -> &mut CoroutineState;
+
+    fn is_ready(&self) -> bool;
+
+    fn is_complete(&self) -> bool;
+
+    fn is_ready_to_yield(&self) -> bool;
+
+    fn run(&mut self);
+
+    fn co_id(&self) -> CoroutineId;
+
+    fn inner_mut(&mut self) -> &mut Any;
+
+    fn kill(&mut self);
+
+}
+
+pub trait ExternalNotifier {
+    fn poll(&self, blocker: ExternalBlocker);
 }
 
 extern "C" fn init_coroutine(mut t: context::Transfer) -> ! {
@@ -91,11 +125,31 @@ extern "C" fn unwind_stack<T: UnwindMove>(t: Transfer) -> Transfer {
 }
 
 
+pub fn new_empty_stream() -> (CoroutineId, Stream<(),()>) {
+    let co_id = CoroutineId::new();
+    let stream = Stream {
+        is_done: false,
+        is_external: true,
+        co_id: co_id,
+        types: PhantomData
+    };
+
+    (co_id, stream)
+}
+
+
+pub fn set_notifier(n: Box<ExternalNotifier>) {
+    SCHEDULER.with(|sc| {
+        *sc.external_notifier.borrow_mut() = n;
+    })
+}
+
 pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
     where F: FnOnce(&mut Flow<Y, R>) -> R + 'static,
           Y: Reflect + 'static,
           R: Reflect + 'static
 {
+
     let stack = PooledStack::new();
     let mut transfer = Transfer::new(Context::new(&stack, init_coroutine), 0);
 
@@ -142,8 +196,6 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
 
         flow.resume();
 
-        // dealoc stack
-
         unreachable!()
 
     }) as Box<FnBox(Transfer)>);
@@ -159,36 +211,14 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
 
     let stream = Stream {
         is_done: false,
+        is_external: false,
         co_id: flow.coroutine_id(),
         types: PhantomData,
     };
 
 
     SCHEDULER.with(|sc| sc.add_co(box Handler { flow: Some(flow) }));
-
     stream
-}
-
-trait CoroutineHandle {
-
-    fn state(&self) -> &CoroutineState;
-
-    fn state_mut(&mut self) -> &mut CoroutineState;
-
-    fn is_ready(&self) -> bool;
-
-    fn is_complete(&self) -> bool;
-
-    fn is_ready_to_yield(&self) -> bool;
-
-    fn run(&mut self);
-
-    fn co_id(&self) -> CoroutineId;
-
-    fn inner_mut(&mut self) -> &mut Any;
-
-    fn kill(&mut self);
-
 }
 
 impl<Y: Reflect + 'static, R: Reflect + 'static> CoroutineHandle for Handler<Y, R> {
@@ -235,14 +265,29 @@ impl<Y: Reflect + 'static, R: Reflect + 'static> CoroutineHandle for Handler<Y, 
     }
 }
 
+impl<'a> ExternalBlocker<'a> {
+    fn new(sc: &'a Scheduler) -> ExternalBlocker<'a> {
+        ExternalBlocker {
+            sc: sc
+        }
+    }
+
+    pub fn unblock_with(&self, co_id: CoroutineId) {
+        if let Some(blocked) = self.sc.blocked.borrow_mut().remove(&co_id) {
+            self.sc.work_queue.borrow_mut().push_back(blocked);
+        }
+    }
+}
+
 
 impl Scheduler {
     fn new() -> Scheduler {
         Scheduler {
             work_queue: RefCell::new(VecDeque::new()),
-            blocked: RefCell::new(BTreeMap::new()),
-            completed: RefCell::new(BTreeMap::new()),
-            ready_to_yield: RefCell::new(BTreeMap::new()),
+            blocked: RefCell::new(HashMap::new()),
+            completed: RefCell::new(HashMap::new()),
+            ready_to_yield: RefCell::new(HashMap::new()),
+            external_notifier: RefCell::new(box ())
         }
     }
 
@@ -251,10 +296,18 @@ impl Scheduler {
             self.work_queue.borrow_mut().push_back(co);
         }
 
+        let mut poll_skipper = 0;
 
         loop {
 
-            // self.resolve_external_compliter(); // for network
+            if poll_skipper > 10000 {
+                self.external_notifier.borrow_mut().poll(ExternalBlocker::new(self));
+                poll_skipper = 0;
+            }
+
+
+            poll_skipper += 1;
+
             // self.resolve_timers();
             let co_opt = self.work_queue.borrow_mut().pop_front();
             if let Some(mut co) = co_opt {
@@ -267,9 +320,14 @@ impl Scheduler {
 
                     CoroutineState::Complete => {
                         let id = co.co_id();
-                        self.completed.borrow_mut().insert(id, co);
 
-                        if let Some(blocked) = self.blocked.borrow_mut().remove(&id) {
+                        let blocked = self.blocked.borrow_mut().remove(&id);
+
+                        if blocked.is_some() || id == wait_id {
+                            self.completed.borrow_mut().insert(id, co);
+                        }
+
+                        if let Some(blocked) = blocked {
                             self.work_queue.borrow_mut().push_back(blocked);
                         }
 
@@ -280,9 +338,17 @@ impl Scheduler {
 
                     CoroutineState::ReadyToYield => {
                         let id = co.co_id();
-                        self.ready_to_yield.borrow_mut().insert(id, co);
 
-                        if let Some(blocked) = self.blocked.borrow_mut().remove(&id) {
+                        let blocked = self.blocked.borrow_mut().remove(&id);
+
+                        if blocked.is_some() || id == wait_id {
+                            self.ready_to_yield.borrow_mut().insert(id, co);
+                        } else {
+                            co.kill();
+                            continue
+                        }
+
+                        if let Some(blocked) = blocked {
                             self.work_queue.borrow_mut().push_back(blocked);
                         }
 
@@ -340,6 +406,7 @@ impl Scheduler {
         if let Some(mut h) = h_opt {
             h.kill();
         }
+
     }
 
     fn add_co(&self, handle: Box<CoroutineHandle>) {
@@ -356,6 +423,14 @@ impl CoroutineId {
             CoroutineId(id)
         })
     }
+
+    pub fn from_usize(u: usize) -> CoroutineId {
+        CoroutineId(u)
+    }
+
+    pub fn as_usize(&self) -> usize {
+        self.0
+    }
 }
 
 impl<Y> Flow<Y, ()> {
@@ -367,9 +442,18 @@ impl<Y> Flow<Y, ()> {
 }
 
 impl<Y, R> Flow<Y, R> {
-    pub fn await<A: Reflect + 'static>(&mut self, stream: Stream<(), A>) -> A {
+    pub fn await<A: Reflect + 'static>(&mut self, mut stream: Stream<(), A>) -> A {
         *self.state_mut() = CoroutineState::BlockedOnCo(stream.co_id);
         self.resume();
+
+        // FIXME: omg
+        if stream.is_external {
+            let mut hack = Some(());
+            let ptr = to_mut_ptr(&mut hack);
+            return from_mut_ptr(ptr);
+
+        }
+
 
         let mut handler = SCHEDULER.with(|sc| {
             sc.completed.borrow_mut().remove(&stream.co_id).unwrap()
@@ -480,7 +564,7 @@ fn to_mut_ptr<T>(data: &mut Option<T>) -> usize {
 
 
 impl<R: Reflect + 'static> Stream<(), R> {
-    pub fn get(self) -> R {
+    pub fn get(mut self) -> R {
         let mut handler = SCHEDULER.with(|sc| {
             sc.schedule_till(self.co_id);
             sc.completed.borrow_mut().remove(&self.co_id).unwrap()
@@ -516,9 +600,20 @@ impl<Y: Reflect + 'static> Iterator for Stream<Y, ()> {
 
 impl<Y, R> Drop for Stream<Y, R> {
     fn drop(&mut self) {
+        if self.is_external {
+            return
+        }
+
         SCHEDULER.with(|sc| {
             sc.drop_co(self.co_id);
         });
+    }
+}
+
+impl ExternalNotifier for () {
+
+    #[inline(always)]
+    fn poll(&self, _: ExternalBlocker){
     }
 }
 
@@ -527,6 +622,8 @@ mod tests {
 
     use super::*;
     use std::thread;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[test]
     fn simple_async() {
@@ -660,6 +757,138 @@ mod tests {
 
         assert_eq!(r, 0);
     }
+
+
+    struct Droppable(Rc<Cell<bool>>);
+
+    impl Drop for Droppable {
+        fn drop(&mut self) {
+            self.0.set(true)
+        }
+    }
+
+
+
+    #[test]
+    fn drops_yielding_stack() {
+        let tester = Rc::new(Cell::new(false));
+        let d = Droppable(tester.clone());
+
+        let mut a = async(move |f| {
+            d;
+            f.yield_it(0);
+            f.yield_it(0);
+        });
+
+        a.next();
+        assert!(!tester.get());
+        a.next();
+        assert!(!tester.get());
+        a.next();
+        assert!(tester.get());
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
+    }
+
+    #[test]
+    fn drops_yielding_depth_stack() {
+        let tester = Rc::new(Cell::new(false));
+        let d = Droppable(tester.clone());
+
+        async(move |f| {
+            let a = async(move |f| {
+                d;
+                f.yield_it(0);
+                f.yield_it(0);
+            }).next().unwrap();
+
+            a
+        }).get();
+
+
+        assert!(tester.get());
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
+    }
+
+    #[test]
+    fn drops_async() {
+        let tester = Rc::new(Cell::new(false));
+        let d = Droppable(tester.clone());
+
+        async(move |f| {
+            async::<_,(),()>(move |_| {
+                d;
+            });
+
+        }).get();
+
+        async(|_| {}).get();
+
+        assert!(tester.get());
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
+    }
+
+    #[test]
+    fn drops_async_yield() {
+        let tester = Rc::new(Cell::new(false));
+        let d = Droppable(tester.clone());
+
+        async(move |f| {
+            async(move |f| {
+                d;
+                f.yield_it(333);
+            });
+
+        }).get();
+
+        async(|_| {}).get();
+        async(|_| {}).get();
+
+
+        assert!(tester.get());
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
+    }
+
+
+
+    #[test]
+    fn drops_simple() {
+        let tester = Rc::new(Cell::new(false));
+        let d = Droppable(tester.clone());
+
+        async(move |_|  {d; 0}).get();
+
+        assert!(tester.get());
+
+        SCHEDULER.with(|sc| {
+            assert_eq!(sc.work_queue.borrow_mut().len(), 0);
+            assert_eq!(sc.ready_to_yield.borrow_mut().len(), 0);
+            assert_eq!(sc.completed.borrow_mut().len(), 0);
+        })
+    }
+
+
+    //FIXME: Drop tests
+    //FIXME: panic tests
 
     // FIXME: type inference for
     // async::<_, (), ()>(|_| loop {});
