@@ -58,6 +58,7 @@ struct Handler<Y, R> {
 
 pub struct Flow<Y, R> {
     coroutine: Option<Coroutine<Y, R>>,
+    to_kill: bool,
 }
 
 pub struct Stream<Y, R> {
@@ -108,9 +109,10 @@ pub trait ExternalNotifier {
 }
 
 extern "C" fn init_coroutine(mut t: context::Transfer) -> ! {
-    let body: Box<FnBox(Transfer)> = from_mut_ptr(t.data);
+    let body: Box<FnBox(Transfer) -> Transfer> = from_mut_ptr(t.data);
 
-    body(t);
+    t = body(t);
+    t.context.resume(0);
 
     unimplemented!()
 }
@@ -149,7 +151,6 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
           Y: Reflect + 'static,
           R: Reflect + 'static
 {
-
     let stack = PooledStack::new();
     let mut transfer = Transfer::new(Context::new(&stack, init_coroutine), 0);
 
@@ -166,6 +167,7 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
                 unwind_ptr: to_mut_ptr(&mut unwind_flow_storage),
                 stack: stack,
             }),
+            to_kill: false,
         };
 
 
@@ -174,7 +176,6 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
 
         let mut f_wrapper = AssertRecoverSafe::new(Some(f));
         let mut flow_wrapper = AssertRecoverSafe::new(Some(flow));
-
         let result = panic::recover(move || {
             let mut flow = flow_wrapper.take().unwrap();
 
@@ -193,13 +194,9 @@ pub fn async<F, Y, R>(mut f: F) -> Stream<Y, R>
             Err(err) => unwind_flow_storage.unwrap(),
         };
 
+        flow.resume_into_transfer()
 
-        flow.resume();
-
-        unreachable!()
-
-    }) as Box<FnBox(Transfer)>);
-
+    }) as Box<FnBox(Transfer) -> Transfer>);
 
     let body_ptr = to_mut_ptr(&mut body);
     transfer = transfer.context.resume(body_ptr);
@@ -470,13 +467,29 @@ impl<Y, R> Flow<Y, R> {
         let mut t = self.transfer_mut().take().unwrap();
         let co = self.coroutine.take().unwrap();
 
-        let mut some_self = Some(Flow { coroutine: Some(co) });
+        let mut some_self = Some(Flow { coroutine: Some(co), to_kill: false });
         let self_ptr = to_mut_ptr(&mut some_self);
         t = t.context.resume(self_ptr);
         let mut s: Self = from_mut_ptr(t.data);
-        *s.transfer_mut() = Some(t);
+
+        if s.to_kill {
+            t = t.context.resume(0);
+        } else {
+            *s.transfer_mut() = Some(t);
+        }
 
         self.coroutine = s.coroutine.take();
+
+    }
+
+    fn resume_into_transfer(mut self) -> Transfer {
+        let mut t = self.transfer_mut().take().unwrap();
+        self.to_kill = true;
+        let mut some_self = Some(self);
+        let self_ptr = to_mut_ptr(&mut some_self);
+        t = t.context.resume(self_ptr);
+
+        t
     }
 
     fn kill(&mut self) {
@@ -487,7 +500,7 @@ impl<Y, R> Flow<Y, R> {
         let mut t = self.transfer_mut().take().unwrap();
         let co = self.coroutine.take().unwrap();
 
-        let mut some_self = Some(Flow { coroutine: Some(co) });
+        let mut some_self = Some(Flow { coroutine: Some(co), to_kill: false });
         let self_ptr = to_mut_ptr(&mut some_self);
 
         t = t.context.resume_ontop(self_ptr, unwind_stack::<Self>);
@@ -541,7 +554,7 @@ impl<Y, R> UnwindMove for Flow<Y, R> {
             let ptr = self.coroutine.as_ref().unwrap().unwind_ptr;
             &mut *(ptr as *mut Option<Self>)
         };
-        *o = Some(Flow { coroutine: self.coroutine.take() });
+        *o = Some(Flow { coroutine: self.coroutine.take(), to_kill: false });
     }
 }
 
@@ -887,7 +900,6 @@ mod tests {
     }
 
 
-    //FIXME: Drop tests
     //FIXME: panic tests
 
     // FIXME: type inference for
