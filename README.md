@@ -1,4 +1,4 @@
-# Monkeys are new coroutines
+# Monkeys are new coroutines [![Build Status](https://travis-ci.org/rozaliev/monkeys.svg)](https://travis-ci.org/rozaliev/monkeys) [![Coverage Status](https://coveralls.io/repos/github/rozaliev/monkeys/badge.svg?branch=master)](https://coveralls.io/github/rozaliev/monkeys?branch=master) [![crates.io](http://meritbadge.herokuapp.com/monkeys)](https://crates.io/crates/monkeys)
 
 This is pre-alpha library, nothing works as expected yet.
 
